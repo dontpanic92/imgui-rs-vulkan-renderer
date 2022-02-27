@@ -133,7 +133,7 @@ impl Allocate for Allocator {
         let mut align =
             unsafe { ash::util::Align::new(data_ptr, std::mem::align_of::<T>() as _, size) };
         align.copy_from_slice(data);
-        unsafe { allocator.unmap_memory(*memory) };
+        unsafe { allocator.unmap_memory(memory) };
 
         Ok(())
     }
