@@ -1,56 +1,31 @@
 use ash::vk;
-use std::{error::Error, fmt, io};
+use imgui::TextureId;
+use thiserror::Error;
 
 /// Crates error type.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RendererError {
     /// Errors coming from calls to Vulkan functions.
-    Vulkan(vk::Result),
+    #[error("A Vulkan error occured: {0}")]
+    Vulkan(#[from] vk::Result),
+
+    #[cfg(feature = "gpu-allocator")]
+    #[error("A gpu allocator error occured: {0}")]
+    GpuAllocator(#[from] gpu_allocator::AllocationError),
+
     /// Io errors.
-    Io(io::Error),
+    #[error("A io error occured: {0}")]
+    Io(#[from] std::io::Error),
+
     /// Initialization errors.
+    #[error("An error occured when initializing the renderer: {0}")]
     Init(String),
-    /// Post destruction renderer usage error.
-    Destroyed,
-}
 
-impl fmt::Display for RendererError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use RendererError::*;
-        match self {
-            Vulkan(error) => write!(f, "A Vulkan error occured: {}", error),
-            Io(error) => write!(f, "An io error occured: {}", error),
-            Init(message) => write!(
-                f,
-                "An error occured when initializing the renderer: {}",
-                message
-            ),
-            Destroyed => write!(f, "You are trying to use the renderer after destoying it"),
-        }
-    }
-}
+    /// Texture lookup error.
+    #[error("Bad texture ID: {}", .0.id())]
+    BadTexture(TextureId),
 
-impl Error for RendererError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        use RendererError::*;
-        match self {
-            Vulkan(error) => Some(error),
-            Io(error) => Some(error),
-            Init(..) | Destroyed => None,
-        }
-    }
-}
-
-#[doc(hidden)]
-impl From<vk::Result> for RendererError {
-    fn from(error: vk::Result) -> RendererError {
-        RendererError::Vulkan(error)
-    }
-}
-
-#[doc(hidden)]
-impl From<io::Error> for RendererError {
-    fn from(error: io::Error) -> RendererError {
-        RendererError::Io(error)
-    }
+    /// Allocator error
+    #[error("A error occured when using the allocator: {0}")]
+    Allocator(String),
 }

@@ -1,68 +1,79 @@
-mod vulkan;
+mod allocator;
+pub mod vulkan;
 
 use crate::RendererError;
-use ash::{vk, Device, Instance};
-use imgui::{Context, DrawCmd, DrawCmdParams, DrawData};
+use ash::{vk, Device};
+use imgui::{Context, DrawCmd, DrawCmdParams, DrawData, TextureId, Textures};
 use mesh::*;
 use ultraviolet::projection::orthographic_vk;
 use vulkan::*;
+
+use self::allocator::Allocator;
+
+#[cfg(not(any(feature = "gpu-allocator", feature = "vk-mem")))]
+use ash::Instance;
+
+#[cfg(feature = "gpu-allocator")]
+use {
+    gpu_allocator::vulkan::Allocator as GpuAllocator,
+    std::sync::{Arc, Mutex},
+};
+
+#[cfg(feature = "vk-mem")]
+use {
+    std::sync::{Arc, Mutex},
+    vk_mem::Allocator as VkMemAllocator,
+};
 
 /// Convenient return type for function that can return a [`RendererError`].
 ///
 /// [`RendererError`]: enum.RendererError.html
 pub type RendererResult<T> = Result<T, RendererError>;
 
-/// Trait providing access to the application's Vulkan context.
-pub trait RendererVkContext {
-    /// Return a reference to the Vulkan instance.
-    fn instance(&self) -> &Instance;
+/// Optional parameters of the renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// The number of in flight frames of the application.
+    pub in_flight_frames: usize,
+    /// If true enables depth test when rendering.
+    pub enable_depth_test: bool,
+    /// If true enables depth writes when rendering.
+    /// 
+    /// Note that depth writes are always disabled when enable_depth_test is false.
+    /// See <https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/VkPipelineDepthStencilStateCreateInfo.html>
+    pub enable_depth_write: bool,
+}
 
-    /// Return the Vulkan physical device.
-    fn physical_device(&self) -> vk::PhysicalDevice;
-
-    /// Return a reference to the Vulkan device.
-    fn device(&self) -> &Device;
-
-    /// Return a Vulkan queue.
-    ///
-    /// It will be used to submit commands during initialization to upload
-    /// data to the gpu. The type of queue must be supported by the following
-    /// commands:
-    ///
-    /// * [vkCmdCopyBufferToImage](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdCopyBufferToImage.html)
-    /// * [vkCmdPipelineBarrier](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdPipelineBarrier.html)
-    fn queue(&self) -> vk::Queue;
-
-    /// Return a Vulkan command pool.
-    ///
-    /// The pool will be used to allocate command buffers to upload textures to the gpu.
-    fn command_pool(&self) -> vk::CommandPool;
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            in_flight_frames: 1,
+            enable_depth_test: false,
+            enable_depth_write: false,
+        }
+    }
 }
 
 /// Vulkan renderer for imgui.
 ///
 /// It records rendering command to the provided command buffer at each call to [`cmd_draw`].
-/// When done with the renderer you should call [`destroy`] before droping it to release all
-/// Vulkan resources held by the renderer.
-///
-/// All methods take a reference to a type implementing the [`RendererVkContext`] trait.
 ///
 /// The renderer holds a set of vertex/index buffers per in flight frames. Vertex and index buffers
 /// are resized at each call to [`cmd_draw`] if draw data does not fit.
 ///
 /// [`cmd_draw`]: #method.cmd_draw
-/// [`destroy`]: #method.destroy
-/// [`RendererVkContext`]: trait.RendererVkContext.html
 pub struct Renderer {
+    device: Device,
+    allocator: Allocator,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    fonts_texture: Texture,
+    fonts_texture: Option<Texture>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
-    in_flight_frames: usize,
+    textures: Textures<vk::DescriptorSet>,
+    options: Options,
     frames: Option<Frames>,
-    destroyed: bool,
 }
 
 impl Renderer {
@@ -73,39 +84,163 @@ impl Renderer {
     ///
     /// # Arguments
     ///
-    /// * `vk_context` - A reference to a type implementing the [`RendererVkContext`] trait.
-    /// * `in_flight_frames` - The number of in flight frames of the application.
+    /// * `instance` - A reference to a Vulkan instance.
+    /// * `physical_device` - A Vulkan physical device.
+    /// * `device` - A Vulkan device.
+    /// * `queue` - A Vulkan queue.
+    ///             It will be used to submit commands during initialization to upload
+    ///             data to the gpu. The type of queue must be supported by the following
+    ///             commands: [vkCmdCopyBufferToImage](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdCopyBufferToImage.html),
+    ///             [vkCmdPipelineBarrier](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdPipelineBarrier.html)
+    /// * `command_pool` - A Vulkan command pool used to allocate command buffers to upload textures to the gpu.
     /// * `render_pass` - The render pass used to render the gui.
     /// * `imgui` - The imgui context.
+    /// * `options` - Optional parameters of the renderer.
     ///
     /// # Errors
     ///
     /// * [`RendererError`] - If the number of in flight frame in incorrect.
     /// * [`RendererError`] - If any Vulkan or io error is encountered during initialization.
-    ///
-    /// [`RendererVkContext`]: trait.RendererVkContext.html
-    /// [`RendererError`]: enum.RendererError.html
-    pub fn new<C: RendererVkContext>(
-        vk_context: &C,
-        in_flight_frames: usize,
+    #[cfg(not(any(feature = "gpu-allocator", feature = "vk-mem")))]
+    pub fn with_default_allocator(
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        device: Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
         render_pass: vk::RenderPass,
         imgui: &mut Context,
+        options: Option<Options>,
     ) -> RendererResult<Self> {
-        if in_flight_frames == 0 {
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+        Self::from_allocator(
+            device,
+            queue,
+            command_pool,
+            Allocator::new(memory_properties),
+            render_pass,
+            imgui,
+            options,
+        )
+    }
+
+    /// Initialize and return a new instance of the renderer.
+    ///
+    /// At initialization all Vulkan resources are initialized and font texture is created and
+    /// uploaded to the gpu. Vertex and index buffers are not created yet.
+    ///
+    /// # Arguments
+    ///
+    /// * `gpu_allocator` - The allocator that will be used to allocator buffer and image memory.
+    /// * `device` - A Vulkan device.
+    /// * `queue` - A Vulkan queue.
+    ///             It will be used to submit commands during initialization to upload
+    ///             data to the gpu. The type of queue must be supported by the following
+    ///             commands: [vkCmdCopyBufferToImage](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdCopyBufferToImage.html),
+    ///             [vkCmdPipelineBarrier](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdPipelineBarrier.html)
+    /// * `command_pool` - A Vulkan command pool used to allocate command buffers to upload textures to the gpu.
+    /// * `render_pass` - The render pass used to render the gui.
+    /// * `imgui` - The imgui context.
+    /// * `options` - Optional parameters of the renderer.
+    ///
+    /// # Errors
+    ///
+    /// * [`RendererError`] - If the number of in flight frame in incorrect.
+    /// * [`RendererError`] - If any Vulkan or io error is encountered during initialization.
+    #[cfg(feature = "gpu-allocator")]
+    pub fn with_gpu_allocator(
+        gpu_allocator: Arc<Mutex<GpuAllocator>>, // TODO: Another way ?
+        device: Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        render_pass: vk::RenderPass,
+        imgui: &mut Context,
+        options: Option<Options>,
+    ) -> RendererResult<Self> {
+        Self::from_allocator(
+            device,
+            queue,
+            command_pool,
+            Allocator::new(gpu_allocator),
+            render_pass,
+            imgui,
+            options,
+        )
+    }
+
+    /// Initialize and return a new instance of the renderer.
+    ///
+    /// At initialization all Vulkan resources are initialized and font texture is created and
+    /// uploaded to the gpu. Vertex and index buffers are not created yet.
+    ///
+    /// # Arguments
+    ///
+    /// * `vk_mem_allocator` - The allocator that will be used to allocator buffer and image memory.
+    /// * `device` - A Vulkan device.
+    /// * `queue` - A Vulkan queue.
+    ///             It will be used to submit commands during initialization to upload
+    ///             data to the gpu. The type of queue must be supported by the following
+    ///             commands: [vkCmdCopyBufferToImage](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdCopyBufferToImage.html),
+    ///             [vkCmdPipelineBarrier](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdPipelineBarrier.html)
+    /// * `command_pool` - A Vulkan command pool used to allocate command buffers to upload textures to the gpu.
+    /// * `render_pass` - The render pass used to render the gui.
+    /// * `imgui` - The imgui context.
+    /// * `options` - Optional parameters of the renderer.
+    ///
+    /// # Errors
+    ///
+    /// * [`RendererError`] - If the number of in flight frame in incorrect.
+    /// * [`RendererError`] - If any Vulkan or io error is encountered during initialization.
+    #[cfg(feature = "vk-mem")]
+    pub fn with_vk_mem_allocator(
+        vk_mem_allocator: Arc<Mutex<VkMemAllocator>>, // TODO: Another way ?
+        device: Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        render_pass: vk::RenderPass,
+        imgui: &mut Context,
+        options: Option<Options>,
+    ) -> RendererResult<Self> {
+        Self::from_allocator(
+            device,
+            queue,
+            command_pool,
+            Allocator::new(vk_mem_allocator),
+            render_pass,
+            imgui,
+            options,
+        )
+    }
+
+    fn from_allocator(
+        device: Device,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        mut allocator: Allocator,
+        render_pass: vk::RenderPass,
+        imgui: &mut Context,
+        options: Option<Options>,
+    ) -> RendererResult<Self> {
+        let options = options.unwrap_or_default();
+
+        log::debug!("Creating imgui renderer with options {:?}", options);
+
+        if options.in_flight_frames == 0 {
             return Err(RendererError::Init(String::from(
                 "'in_flight_frames' parameter should be at least one",
             )));
         }
 
         // Descriptor set layout
-        let descriptor_set_layout = create_vulkan_descriptor_set_layout(vk_context.device())?;
+        let descriptor_set_layout = create_vulkan_descriptor_set_layout(&device)?;
 
         // Pipeline and layout
-        let pipeline_layout =
-            create_vulkan_pipeline_layout(vk_context.device(), descriptor_set_layout)?;
-        let pipeline = create_vulkan_pipeline(vk_context.device(), pipeline_layout, render_pass)?;
+        let pipeline_layout = create_vulkan_pipeline_layout(&device, descriptor_set_layout)?;
+        let pipeline = create_vulkan_pipeline(&device, pipeline_layout, render_pass, options)?;
 
-        // Font texture
+        // Fonts texture
         let fonts_texture = {
             let mut fonts = imgui.fonts();
 
@@ -125,100 +260,208 @@ impl Renderer {
             fonts.tex_desired_width = device_properties.limits.max_image_dimension2_d as i32;
 
             let atlas_texture = fonts.build_rgba32_texture();
-            let memory_properties = unsafe {
-                vk_context
-                    .instance()
-                    .get_physical_device_memory_properties(vk_context.physical_device())
-            };
 
-            execute_one_time_commands(
-                vk_context.device(),
-                vk_context.queue(),
-                vk_context.command_pool(),
-                |buffer| {
-                    Texture::cmd_from_rgba(
-                        vk_context.device(),
-                        buffer,
-                        memory_properties,
-                        atlas_texture.width,
-                        atlas_texture.height,
-                        vk::Format::R8G8B8A8_UNORM,
-                        &atlas_texture.data,
-                    )
-                },
-            )??
+            Texture::from_rgba8(
+                &device,
+                queue,
+                command_pool,
+                &mut allocator,
+                atlas_texture.width,
+                atlas_texture.height,
+                atlas_texture.data,
+            )?
         };
 
+        let mut fonts = imgui.fonts();
+        fonts.tex_id = TextureId::from(usize::MAX);
+
+        // Descriptor pool
+        let descriptor_pool = create_vulkan_descriptor_pool(&device, 1)?;
+
         // Descriptor set
-        let (descriptor_pool, descriptor_set) = create_vulkan_descriptor_set(
-            vk_context.device(),
+        let descriptor_set = create_vulkan_descriptor_set(
+            &device,
             descriptor_set_layout,
-            &fonts_texture,
+            descriptor_pool,
+            fonts_texture.image_view,
+            fonts_texture.sampler,
         )?;
 
+        // Textures
+        let textures = Textures::new();
+
         Ok(Self {
+            device,
+            allocator,
             pipeline,
             pipeline_layout,
             descriptor_set_layout,
-            fonts_texture,
+            fonts_texture: Some(fonts_texture),
             descriptor_pool,
             descriptor_set,
-            in_flight_frames,
+            textures,
+            options,
             frames: None,
-            destroyed: false,
         })
+    }
+
+    /// Change the render pass to render to.
+    ///
+    /// Useful if you need to render to a new render pass but don't want to rebuild
+    /// the entire renderer. It will rebuild the graphics pipeline from scratch so it
+    /// is an expensive operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `render_pass` - The render pass used to render the gui.
+    ///
+    /// # Errors
+    ///
+    /// * [`RendererError`] - If any Vulkan error is encountered during pipeline creation.
+    pub fn set_render_pass(&mut self, render_pass: vk::RenderPass) -> RendererResult<()> {
+        unsafe { self.device.destroy_pipeline(self.pipeline, None) };
+        self.pipeline = create_vulkan_pipeline(
+            &self.device,
+            self.pipeline_layout,
+            render_pass,
+            self.options,
+        )?;
+        Ok(())
+    }
+
+    /// Returns the texture mapping used by the renderer to lookup textures.
+    ///
+    /// Textures are provided by the application as `vk::DescriptorSet`s.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let descriptor_set = ...;
+    /// // Insert a vk::DescriptorSet in the renderer textures map.
+    /// // The renderer returns a generated texture id.
+    /// let texture_id = renderer.textures().insert(descriptor_set);
+    /// ...
+    /// // Create an `Image` that references the texture by its id.
+    /// Image::new(texture_id, [100, 100]).build(&ui);
+    /// ```
+    ///
+    /// # Caveat
+    ///
+    /// Provided `vk::DescriptorSet`s must be created with a descriptor set layout that is compatible with the one used by the renderer.
+    /// See [Pipeline Layout Compatibility](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#descriptorsets-compatibility).
+    pub fn textures(&mut self) -> &mut Textures<vk::DescriptorSet> {
+        &mut self.textures
+    }
+
+    fn lookup_descriptor_set(&self, texture_id: TextureId) -> RendererResult<vk::DescriptorSet> {
+        if texture_id.id() == usize::MAX {
+            Ok(self.descriptor_set)
+        } else if let Some(descriptor_set) = self.textures.get(texture_id) {
+            Ok(*descriptor_set)
+        } else {
+            Err(RendererError::BadTexture(texture_id))
+        }
+    }
+
+    /// Update the fonts texture after having added new fonts to imgui.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - A Vulkan queue.
+    ///             It will be used to submit commands during initialization to upload
+    ///             data to the gpu. The type of queue must be supported by the following
+    ///             commands: [vkCmdCopyBufferToImage](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdCopyBufferToImage.html),
+    ///             [vkCmdPipelineBarrier](https://www.khronos.org/registry/vulkan/specs/1.2-extensions/man/html/vkCmdPipelineBarrier.html)
+    /// * `command_pool` - A Vulkan command pool used to allocate command buffers to upload textures to the gpu.
+    /// * `imgui` - The imgui context.
+    ///
+    /// # Errors
+    ///
+    /// * [`RendererError`] - If any error is encountered during texture update.
+    pub fn update_fonts_texture(
+        &mut self,
+        queue: vk::Queue,
+        command_pool: vk::CommandPool,
+        imgui: &mut Context,
+    ) -> RendererResult<()> {
+        // Generate the new fonts texture
+        let fonts_texture = {
+            let mut fonts = imgui.fonts();
+            let atlas_texture = fonts.build_rgba32_texture();
+
+            Texture::from_rgba8(
+                &self.device,
+                queue,
+                command_pool,
+                &mut self.allocator,
+                atlas_texture.width,
+                atlas_texture.height,
+                atlas_texture.data,
+            )?
+        };
+
+        let mut fonts = imgui.fonts();
+        fonts.tex_id = TextureId::from(usize::MAX);
+
+        // Free Descriptor set the create a new one
+        let old_descriptor_set = self.descriptor_set;
+        unsafe {
+            self.device
+                .free_descriptor_sets(self.descriptor_pool, &[old_descriptor_set])?
+        };
+        self.descriptor_set = create_vulkan_descriptor_set(
+            &self.device,
+            self.descriptor_set_layout,
+            self.descriptor_pool,
+            fonts_texture.image_view,
+            fonts_texture.sampler,
+        )?;
+
+        // Free old fonts texture
+        let mut old_texture = self.fonts_texture.replace(fonts_texture);
+        if let Some(texture) = old_texture.take() {
+            texture.destroy(&self.device, &mut self.allocator)?;
+        }
+
+        Ok(())
     }
 
     /// Record commands required to render the gui.RendererError.
     ///
     /// # Arguments
     ///
-    /// * `vk_context` - A reference to a type implementing the [`RendererVkContext`] trait.
     /// * `command_buffer` - The Vulkan command buffer that command will be recorded to.
     /// * `draw_data` - A reference to the imgui `DrawData` containing rendering data.
     ///
     /// # Errors
     ///
-    /// * [`RendererError`] - If any Vulkan is encountered during command recording.
-    /// * [`RendererError`] - If the method is call after [`destroy`] was called.
-    ///
-    /// [`RendererVkContext`]: trait.RendererVkContext.html
-    /// [`RendererError`]: enum.RendererError.html
-    /// [`destroy`]: #method.destroy
-    pub fn cmd_draw<C: RendererVkContext>(
+    /// * [`RendererError`] - If any Vulkan error is encountered during command recording.
+    pub fn cmd_draw(
         &mut self,
-        vk_context: &C,
         command_buffer: vk::CommandBuffer,
         draw_data: &DrawData,
     ) -> RendererResult<()> {
-        if self.destroyed {
-            return Err(RendererError::Destroyed);
+        if draw_data.total_vtx_count == 0 {
+            return Ok(());
         }
 
         if self.frames.is_none() {
-            self.frames
-                .replace(Frames::new(vk_context, draw_data, self.in_flight_frames)?);
+            self.frames.replace(Frames::new(
+                &self.device,
+                &mut self.allocator,
+                draw_data,
+                self.options.in_flight_frames,
+            )?);
         }
 
         let mesh = self.frames.as_mut().unwrap().next();
-        mesh.update(vk_context, draw_data)?;
+        mesh.update(&self.device, &mut self.allocator, draw_data)?;
 
         unsafe {
-            vk_context.device().cmd_bind_pipeline(
+            self.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline,
-            )
-        };
-
-        unsafe {
-            vk_context.device().cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[self.descriptor_set],
-                &[],
             )
         };
 
@@ -231,18 +474,20 @@ impl Renderer {
             ..Default::default()
         }];
 
-        unsafe {
-            vk_context
-                .device()
-                .cmd_set_viewport(command_buffer, 0, &viewports)
-        };
+        unsafe { self.device.cmd_set_viewport(command_buffer, 0, &viewports) };
 
         // Ortho projection
-        let projection =
-            orthographic_vk(0.0, framebuffer_width, 0.0, -framebuffer_height, -1.0, 1.0);
+        let projection = orthographic_vk(
+            0.0,
+            draw_data.display_size[0],
+            0.0,
+            -draw_data.display_size[1],
+            -1.0,
+            1.0,
+        );
         unsafe {
             let push = any_as_u8_slice(&projection);
-            vk_context.device().cmd_push_constants(
+            self.device.cmd_push_constants(
                 command_buffer,
                 self.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX,
@@ -252,7 +497,7 @@ impl Renderer {
         };
 
         unsafe {
-            vk_context.device().cmd_bind_index_buffer(
+            self.device.cmd_bind_index_buffer(
                 command_buffer,
                 mesh.indices,
                 0,
@@ -261,13 +506,13 @@ impl Renderer {
         };
 
         unsafe {
-            vk_context
-                .device()
+            self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertices], &[0])
         };
 
         let mut index_offset = 0;
         let mut vertex_offset = 0;
+        let mut current_texture_id: Option<TextureId> = None;
         let clip_offset = draw_data.display_pos;
         let clip_scale = draw_data.framebuffer_scale;
         for draw_list in draw_data.draw_lists() {
@@ -278,9 +523,9 @@ impl Renderer {
                         cmd_params:
                             DrawCmdParams {
                                 clip_rect,
+                                texture_id,
                                 vtx_offset,
                                 idx_offset,
-                                ..
                             },
                     } => {
                         unsafe {
@@ -299,13 +544,26 @@ impl Renderer {
                                     height: clip_h as _,
                                 },
                             }];
-                            vk_context
-                                .device()
-                                .cmd_set_scissor(command_buffer, 0, &scissors);
+                            self.device.cmd_set_scissor(command_buffer, 0, &scissors);
+                        }
+
+                        if Some(texture_id) != current_texture_id {
+                            let descriptor_set = self.lookup_descriptor_set(texture_id)?;
+                            unsafe {
+                                self.device.cmd_bind_descriptor_sets(
+                                    command_buffer,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    self.pipeline_layout,
+                                    0,
+                                    &[descriptor_set],
+                                    &[],
+                                )
+                            };
+                            current_texture_id = Some(texture_id);
                         }
 
                         unsafe {
-                            vk_context.device().cmd_draw_indexed(
+                            self.device.cmd_draw_indexed(
                                 command_buffer,
                                 count as _,
                                 1,
@@ -315,7 +573,12 @@ impl Renderer {
                             )
                         };
                     }
-                    _ => (), // Ignored for now
+                    DrawCmd::ResetRenderState => {
+                        log::trace!("Reset render state command not yet supported")
+                    }
+                    DrawCmd::RawCallback { .. } => {
+                        log::trace!("Raw callback command not yet supported")
+                    }
                 }
             }
 
@@ -325,39 +588,29 @@ impl Renderer {
 
         Ok(())
     }
+}
 
-    /// Destroy Vulkan resources held by the renderer.
-    ///
-    /// # Arguments
-    ///
-    /// * `vk_context` - A reference to a type implementing the [`RendererVkContext`] trait.
-    ///
-    /// # Errors
-    ///
-    /// * [`RendererError`] - If the method is call after [`destroy`] was called.
-    ///
-    /// [`destroy`]: #method.destroy
-    /// [`RendererVkContext`]: trait.RendererVkContext.html
-    /// [`RendererError`]: enum.RendererError.html
-    pub fn destroy<C: RendererVkContext>(&mut self, context: &C) -> RendererResult<()> {
-        if self.destroyed {
-            return Err(RendererError::Destroyed);
-        }
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        log::debug!("Destroying ImGui Renderer");
+        let device = &self.device;
 
         unsafe {
-            let device = context.device();
-            if let Some(mut frames) = self.frames.take() {
-                frames.destroy(device);
+            if let Some(frames) = self.frames.take() {
+                frames
+                    .destroy(device, &mut self.allocator)
+                    .expect("Failed to destroy frame data");
             }
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
-            self.fonts_texture.destroy(device);
+            self.fonts_texture
+                .take()
+                .unwrap()
+                .destroy(device, &mut self.allocator)
+                .expect("Failed to fronts data");
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
         }
-        self.destroyed = true;
-
-        Ok(())
     }
 }
 
@@ -369,13 +622,14 @@ struct Frames {
 }
 
 impl Frames {
-    fn new<C: RendererVkContext>(
-        vk_context: &C,
+    fn new(
+        device: &Device,
+        allocator: &mut Allocator,
         draw_data: &DrawData,
         count: usize,
     ) -> RendererResult<Self> {
         let meshes = (0..count)
-            .map(|_| Mesh::new(vk_context, draw_data))
+            .map(|_| Mesh::new(device, allocator, draw_data))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             index: 0,
@@ -390,15 +644,18 @@ impl Frames {
         result
     }
 
-    fn destroy(&mut self, device: &Device) {
-        self.meshes.iter_mut().for_each(|m| m.destroy(device));
-        self.meshes.clear();
+    fn destroy(self, device: &Device, allocator: &mut Allocator) -> RendererResult<()> {
+        for mesh in self.meshes.into_iter() {
+            mesh.destroy(device, allocator)?;
+        }
+        Ok(())
     }
 }
 
 mod mesh {
 
-    use super::{vulkan::*, RendererVkContext};
+    use super::allocator::{Allocate, Allocator, Memory};
+    use super::vulkan::*;
     use crate::RendererResult;
     use ash::{vk, Device};
     use imgui::{DrawData, DrawVert};
@@ -407,16 +664,17 @@ mod mesh {
     /// Vertex and index buffer resources for one frame in flight.
     pub struct Mesh {
         pub vertices: vk::Buffer,
-        vertices_mem: vk::DeviceMemory,
+        vertices_mem: Memory,
         vertex_count: usize,
         pub indices: vk::Buffer,
-        indices_mem: vk::DeviceMemory,
+        indices_mem: Memory,
         index_count: usize,
     }
 
     impl Mesh {
-        pub fn new<C: RendererVkContext>(
-            vk_context: &C,
+        pub fn new(
+            device: &Device,
+            allocator: &mut Allocator,
             draw_data: &DrawData,
         ) -> RendererResult<Self> {
             let vertices = create_vertices(draw_data);
@@ -425,24 +683,19 @@ mod mesh {
             let index_count = indices.len();
 
             // Create a vertex buffer
-            let memory_properties = unsafe {
-                vk_context
-                    .instance()
-                    .get_physical_device_memory_properties(vk_context.physical_device())
-            };
             let (vertices, vertices_mem) = create_and_fill_buffer(
+                device,
+                allocator,
                 &vertices,
-                vk_context.device(),
                 vk::BufferUsageFlags::VERTEX_BUFFER,
-                memory_properties,
             )?;
 
             // Create an index buffer
             let (indices, indices_mem) = create_and_fill_buffer(
+                device,
+                allocator,
                 &indices,
-                vk_context.device(),
                 vk::BufferUsageFlags::INDEX_BUFFER,
-                memory_properties,
             )?;
 
             Ok(Mesh {
@@ -455,73 +708,59 @@ mod mesh {
             })
         }
 
-        pub fn update<C: RendererVkContext>(
+        pub fn update(
             &mut self,
-            vk_context: &C,
+            device: &Device,
+            allocator: &mut Allocator,
             draw_data: &DrawData,
         ) -> RendererResult<()> {
-            let memory_properties = unsafe {
-                vk_context
-                    .instance()
-                    .get_physical_device_memory_properties(vk_context.physical_device())
-            };
-
             let vertices = create_vertices(draw_data);
             if draw_data.total_vtx_count as usize > self.vertex_count {
                 log::trace!("Resizing vertex buffers");
-                self.destroy_vertices(vk_context.device());
+
                 let vertex_count = vertices.len();
                 let size = vertex_count * size_of::<DrawVert>();
-                let (vertices, vertices_mem) = create_buffer(
-                    size,
-                    vk_context.device(),
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                    memory_properties,
-                )?;
+                let (vertices, vertices_mem) =
+                    allocator.create_buffer(device, size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
 
-                self.vertices = vertices;
-                self.vertices_mem = vertices_mem;
                 self.vertex_count = vertex_count;
+
+                let old_vertices = self.vertices;
+                self.vertices = vertices;
+
+                let old_vertices_mem = std::mem::replace(&mut self.vertices_mem, vertices_mem);
+
+                allocator.destroy_buffer(device, old_vertices, old_vertices_mem)?;
             }
-            update_buffer_content(vk_context.device(), self.vertices_mem, &vertices)?;
+            allocator.update_buffer(device, &self.vertices_mem, &vertices)?;
 
             let indices = create_indices(draw_data);
             if draw_data.total_idx_count as usize > self.index_count {
                 log::trace!("Resizing index buffers");
-                self.destroy_indices(vk_context.device());
+
                 let index_count = indices.len();
                 let size = index_count * size_of::<u16>();
-                let (indices, indices_mem) = create_buffer(
-                    size,
-                    vk_context.device(),
-                    vk::BufferUsageFlags::INDEX_BUFFER,
-                    memory_properties,
-                )?;
-                self.indices = indices;
-                self.indices_mem = indices_mem;
+                let (indices, indices_mem) =
+                    allocator.create_buffer(device, size, vk::BufferUsageFlags::INDEX_BUFFER)?;
+
                 self.index_count = index_count;
+
+                let old_indices = self.indices;
+                self.indices = indices;
+
+                let old_indices_mem = std::mem::replace(&mut self.indices_mem, indices_mem);
+
+                allocator.destroy_buffer(device, old_indices, old_indices_mem)?;
             }
-            update_buffer_content(vk_context.device(), self.indices_mem, &indices)?;
+            allocator.update_buffer(device, &self.indices_mem, &indices)?;
 
             Ok(())
         }
 
-        pub fn destroy(&mut self, device: &Device) {
-            self.destroy_indices(device);
-            self.destroy_vertices(device);
-        }
-
-        fn destroy_vertices(&mut self, device: &Device) {
-            unsafe {
-                device.destroy_buffer(self.vertices, None);
-                device.free_memory(self.vertices_mem, None);
-            }
-        }
-        fn destroy_indices(&mut self, device: &Device) {
-            unsafe {
-                device.destroy_buffer(self.indices, None);
-                device.free_memory(self.indices_mem, None);
-            }
+        pub fn destroy(self, device: &Device, allocator: &mut Allocator) -> RendererResult<()> {
+            allocator.destroy_buffer(device, self.vertices, self.vertices_mem)?;
+            allocator.destroy_buffer(device, self.indices, self.indices_mem)?;
+            Ok(())
         }
     }
 
