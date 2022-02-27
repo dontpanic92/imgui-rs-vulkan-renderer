@@ -18,7 +18,7 @@ exclude = [
 
 [dependencies]
 log = "0.4"
-imgui = "0.8.0"
+imgui = { git = "https://github.com/imgui-rs/imgui-rs/", features = ["docking"] }
 ash = "0.33.3"
 ultraviolet = "0.4"
 
