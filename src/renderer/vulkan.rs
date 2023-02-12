@@ -1,62 +1,24 @@
-use crate::RendererResult;
+//! Vulkan helpers.
+//!
+//! A set of functions used to ease Vulkan resources creations. These are supposed to be internal but
+//! are exposed since they might help users create descriptors sets when using the custom textures.
+
+use crate::{Options, RendererResult};
 use ash::{vk, Device};
-pub use buffer::*;
+pub(crate) use buffer::*;
 use std::{ffi::CString, mem};
-pub use texture::*;
+pub(crate) use texture::*;
 
-pub fn execute_one_time_commands<R, F: FnOnce(vk::CommandBuffer) -> R>(
-    device: &Device,
-    queue: vk::Queue,
-    pool: vk::CommandPool,
-    executor: F,
-) -> RendererResult<R> {
-    let command_buffer = {
-        let alloc_info = vk::CommandBufferAllocateInfo::builder()
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_pool(pool)
-            .command_buffer_count(1);
-
-        unsafe { device.allocate_command_buffers(&alloc_info)?[0] }
-    };
-    let command_buffers = [command_buffer];
-
-    // Begin recording
-    {
-        let begin_info = vk::CommandBufferBeginInfo::builder()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { device.begin_command_buffer(command_buffer, &begin_info)? };
-    }
-
-    // Execute user function
-    let executor_result = executor(command_buffer);
-
-    // End recording
-    unsafe { device.end_command_buffer(command_buffer)? };
-
-    // Submit and wait
-    {
-        let submit_info = vk::SubmitInfo::builder()
-            .command_buffers(&command_buffers)
-            .build();
-        let submit_infos = [submit_info];
-        unsafe {
-            device.queue_submit(queue, &submit_infos, vk::Fence::null())?;
-            device.queue_wait_idle(queue)?;
-        };
-    }
-
-    // Free
-    unsafe { device.free_command_buffers(pool, &command_buffers) };
-
-    Ok(executor_result)
-}
+#[cfg(feature = "dynamic-rendering")]
+use crate::DynamicRendering;
 
 /// Return a `&[u8]` for any sized object passed in.
-pub unsafe fn any_as_u8_slice<T: Sized>(any: &T) -> &[u8] {
+pub(crate) unsafe fn any_as_u8_slice<T: Sized>(any: &T) -> &[u8] {
     let ptr = (any as *const T) as *const u8;
     std::slice::from_raw_parts(ptr, std::mem::size_of::<T>())
 }
 
+/// Create a descriptor set layout compatible with the graphics pipeline.
 pub fn create_vulkan_descriptor_set_layout(
     device: &Device,
 ) -> RendererResult<vk::DescriptorSetLayout> {
@@ -74,7 +36,7 @@ pub fn create_vulkan_descriptor_set_layout(
     unsafe { Ok(device.create_descriptor_set_layout(&descriptor_set_create_info, None)?) }
 }
 
-pub fn create_vulkan_pipeline_layout(
+pub(crate) fn create_vulkan_pipeline_layout(
     device: &Device,
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> RendererResult<vk::PipelineLayout> {
@@ -95,10 +57,12 @@ pub fn create_vulkan_pipeline_layout(
     Ok(pipeline_layout)
 }
 
-pub fn create_vulkan_pipeline(
+pub(crate) fn create_vulkan_pipeline(
     device: &Device,
     pipeline_layout: vk::PipelineLayout,
-    render_pass: vk::RenderPass,
+    #[cfg(not(feature = "dynamic-rendering"))] render_pass: vk::RenderPass,
+    #[cfg(feature = "dynamic-rendering")] dynamic_rendering: DynamicRendering,
+    options: Options,
 ) -> RendererResult<vk::Pipeline> {
     let entry_point_name = CString::new("main").unwrap();
 
@@ -186,13 +150,18 @@ pub fn create_vulkan_pipeline(
         .alpha_to_one_enable(false);
 
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
-        .color_write_mask(vk::ColorComponentFlags::all())
+        .color_write_mask(
+            vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
+        )
         .blend_enable(true)
         .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
         .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .color_blend_op(vk::BlendOp::ADD)
         .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .alpha_blend_op(vk::BlendOp::ADD)
         .build()];
     let color_blending_info = vk::PipelineColorBlendStateCreateInfo::builder()
@@ -201,19 +170,19 @@ pub fn create_vulkan_pipeline(
         .attachments(&color_blend_attachments)
         .blend_constants([0.0, 0.0, 0.0, 0.0]);
 
-    let dynamic_states = [vk::DynamicState::SCISSOR, vk::DynamicState::VIEWPORT];
-    let dynamic_states_info =
-        vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
-
     let depth_stencil_state_create_info = vk::PipelineDepthStencilStateCreateInfo::builder()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
+        .depth_test_enable(options.enable_depth_test)
+        .depth_write_enable(options.enable_depth_write)
         .depth_compare_op(vk::CompareOp::ALWAYS)
         .depth_bounds_test_enable(false)
         .stencil_test_enable(false)
         .build();
 
-    let pipeline_info = [vk::GraphicsPipelineCreateInfo::builder()
+    let dynamic_states = [vk::DynamicState::SCISSOR, vk::DynamicState::VIEWPORT];
+    let dynamic_states_info =
+        vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
         .stages(&shader_states_infos)
         .vertex_input_state(&vertex_input_info)
         .input_assembly_state(&input_assembly_info)
@@ -221,16 +190,34 @@ pub fn create_vulkan_pipeline(
         .viewport_state(&viewport_info)
         .multisample_state(&multisampling_info)
         .color_blend_state(&color_blending_info)
-        .dynamic_state(&dynamic_states_info)
-        .layout(pipeline_layout)
-        .render_pass(render_pass)
-        .subpass(0)
         .depth_stencil_state(&depth_stencil_state_create_info)
-        .build()];
+        .dynamic_state(&dynamic_states_info)
+        .layout(pipeline_layout);
+
+    #[cfg(not(feature = "dynamic-rendering"))]
+    let pipeline_info = pipeline_info.render_pass(render_pass);
+
+    #[cfg(feature = "dynamic-rendering")]
+    let color_attachment_formats = [dynamic_rendering.color_attachment_format];
+    #[cfg(feature = "dynamic-rendering")]
+    let mut rendering_info = {
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::builder()
+            .color_attachment_formats(&color_attachment_formats);
+        if let Some(depth_attachment_format) = dynamic_rendering.depth_attachment_format {
+            rendering_info = rendering_info.depth_attachment_format(depth_attachment_format);
+        }
+        rendering_info
+    };
+    #[cfg(feature = "dynamic-rendering")]
+    let pipeline_info = pipeline_info.push_next(&mut rendering_info);
 
     let pipeline = unsafe {
         device
-            .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&pipeline_info),
+                None,
+            )
             .map_err(|e| e.1)?[0]
     };
 
@@ -248,36 +235,47 @@ fn read_shader_from_source(source: &[u8]) -> RendererResult<Vec<u32>> {
     Ok(ash::util::read_spv(&mut cursor)?)
 }
 
+/// Create a descriptor pool of sets compatible with the graphics pipeline.
+pub fn create_vulkan_descriptor_pool(
+    device: &Device,
+    max_sets: u32,
+) -> RendererResult<vk::DescriptorPool> {
+    log::debug!("Creating vulkan descriptor pool");
+
+    let sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: 1,
+    }];
+    let create_info = vk::DescriptorPoolCreateInfo::builder()
+        .pool_sizes(&sizes)
+        .max_sets(max_sets)
+        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+    unsafe { Ok(device.create_descriptor_pool(&create_info, None)?) }
+}
+
+/// Create a descriptor set compatible with the graphics pipeline from a texture.
 pub fn create_vulkan_descriptor_set(
     device: &Device,
-    sets_layout: vk::DescriptorSetLayout,
-    texture: &texture::Texture,
-) -> RendererResult<(vk::DescriptorPool, vk::DescriptorSet)> {
+    set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    image_view: vk::ImageView,
+    sampler: vk::Sampler,
+) -> RendererResult<vk::DescriptorSet> {
     log::debug!("Creating vulkan descriptor set");
-    let descriptor_pool = {
-        let sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
-        }];
-        let create_info = vk::DescriptorPoolCreateInfo::builder()
-            .pool_sizes(&sizes)
-            .max_sets(1);
-        unsafe { device.create_descriptor_pool(&create_info, None)? }
-    };
 
     let set = {
-        let sets_layout = [sets_layout];
+        let set_layouts = [set_layout];
         let allocate_info = vk::DescriptorSetAllocateInfo::builder()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&sets_layout);
+            .set_layouts(&set_layouts);
 
         unsafe { device.allocate_descriptor_sets(&allocate_info)?[0] }
     };
 
     unsafe {
         let image_info = [vk::DescriptorImageInfo {
-            sampler: texture.sampler,
-            image_view: texture.image_view,
+            sampler,
+            image_view,
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }];
 
@@ -290,163 +288,100 @@ pub fn create_vulkan_descriptor_set(
         device.update_descriptor_sets(&writes, &[])
     }
 
-    Ok((descriptor_pool, set))
+    Ok(set)
 }
 
 mod buffer {
 
-    use crate::RendererResult;
-    use ash::{vk, Device};
+    use crate::{
+        renderer::allocator::{Allocate, Allocator, Memory},
+        RendererResult,
+    };
+    use ash::vk;
+    use ash::Device;
     use std::mem;
 
-    pub fn create_and_fill_buffer<T: Copy>(
-        data: &[T],
+    pub fn create_and_fill_buffer<T>(
         device: &Device,
+        allocator: &mut Allocator,
+        data: &[T],
         usage: vk::BufferUsageFlags,
-        mem_properties: vk::PhysicalDeviceMemoryProperties,
-    ) -> RendererResult<(vk::Buffer, vk::DeviceMemory)> {
+    ) -> RendererResult<(vk::Buffer, Memory)>
+    where
+        T: Copy,
+    {
         let size = data.len() * mem::size_of::<T>();
-        let (buffer, memory) = create_buffer(size, device, usage, mem_properties)?;
-        update_buffer_content(device, memory, data)?;
+        let (buffer, memory) = allocator.create_buffer(device, size, usage)?;
+        allocator.update_buffer(device, &memory, data)?;
         Ok((buffer, memory))
-    }
-
-    pub fn create_buffer(
-        size: usize,
-        device: &Device,
-        usage: vk::BufferUsageFlags,
-        mem_properties: vk::PhysicalDeviceMemoryProperties,
-    ) -> RendererResult<(vk::Buffer, vk::DeviceMemory)> {
-        let buffer_info = vk::BufferCreateInfo::builder()
-            .size(size as _)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .build();
-        let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
-
-        let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let mem_type = find_memory_type(
-            mem_requirements,
-            mem_properties,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-
-        let alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(mem_type);
-        let memory = unsafe { device.allocate_memory(&alloc_info, None)? };
-        unsafe { device.bind_buffer_memory(buffer, memory, 0)? };
-
-        Ok((buffer, memory))
-    }
-
-    pub fn update_buffer_content<T: Copy>(
-        device: &Device,
-        buffer_memory: vk::DeviceMemory,
-        data: &[T],
-    ) -> RendererResult<()> {
-        unsafe {
-            let size = (data.len() * mem::size_of::<T>()) as _;
-
-            let data_ptr =
-                device.map_memory(buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
-            let mut align = ash::util::Align::new(data_ptr, mem::align_of::<T>() as _, size);
-            align.copy_from_slice(&data);
-            device.unmap_memory(buffer_memory);
-        };
-        Ok(())
-    }
-
-    pub fn find_memory_type(
-        requirements: vk::MemoryRequirements,
-        mem_properties: vk::PhysicalDeviceMemoryProperties,
-        required_properties: vk::MemoryPropertyFlags,
-    ) -> u32 {
-        for i in 0..mem_properties.memory_type_count {
-            if requirements.memory_type_bits & (1 << i) != 0
-                && mem_properties.memory_types[i as usize]
-                    .property_flags
-                    .contains(required_properties)
-            {
-                return i;
-            }
-        }
-        panic!("Failed to find suitable memory type.")
     }
 }
 
 mod texture {
 
     use super::buffer::*;
+    use crate::renderer::allocator::{Allocate, Allocator, Memory};
     use crate::RendererResult;
     use ash::vk;
     use ash::Device;
 
+    /// Helper struct representing a sampled texture.
     pub struct Texture {
-        buffer: vk::Buffer,
-        buffer_mem: vk::DeviceMemory,
         pub image: vk::Image,
-        image_mem: vk::DeviceMemory,
+        image_mem: Memory,
         pub image_view: vk::ImageView,
         pub sampler: vk::Sampler,
     }
 
     impl Texture {
-        pub fn cmd_from_rgba(
+        /// Create a texture from an `u8` array containing an rgba image.
+        ///
+        /// The image data is device local and it's format is R8G8B8A8_UNORM.
+        ///     
+        /// # Arguments
+        ///
+        /// * `device` - The Vulkan logical device.
+        /// * `queue` - The queue with transfer capabilities to execute commands.
+        /// * `command_pool` - The command pool used to create a command buffer used to record commands.
+        /// * `allocator` - Allocator used to allocate memory for the image.
+        /// * `width` - The width of the image.
+        /// * `height` - The height of the image.
+        /// * `data` - The image data.
+        pub fn from_rgba8(
             device: &Device,
-            command_buffer: vk::CommandBuffer,
-            mem_properties: vk::PhysicalDeviceMemoryProperties,
+            queue: vk::Queue,
+            command_pool: vk::CommandPool,
+            allocator: &mut Allocator,
             width: u32,
             height: u32,
-            format: vk::Format,
             data: &[u8],
         ) -> RendererResult<Self> {
+            let (texture, staging_buff, staging_mem) =
+                execute_one_time_commands(device, queue, command_pool, |buffer| {
+                    Self::cmd_from_rgba(device, allocator, buffer, width, height, data)
+                })??;
+
+            allocator.destroy_buffer(device, staging_buff, staging_mem)?;
+
+            Ok(texture)
+        }
+
+        fn cmd_from_rgba(
+            device: &Device,
+            allocator: &mut Allocator,
+            command_buffer: vk::CommandBuffer,
+            width: u32,
+            height: u32,
+            data: &[u8],
+        ) -> RendererResult<(Self, vk::Buffer, Memory)> {
             let (buffer, buffer_mem) = create_and_fill_buffer(
-                data,
                 device,
+                allocator,
+                data,
                 vk::BufferUsageFlags::TRANSFER_SRC,
-                mem_properties,
             )?;
 
-            let (image, image_mem) = {
-                let extent = vk::Extent3D {
-                    width: width,
-                    height: height,
-                    depth: 1,
-                };
-
-                let image_info = vk::ImageCreateInfo::builder()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(extent)
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .format(format)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .flags(vk::ImageCreateFlags::empty());
-
-                let image = unsafe { device.create_image(&image_info, None)? };
-                let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
-                let mem_type_index = find_memory_type(
-                    mem_requirements,
-                    mem_properties,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                );
-
-                let alloc_info = vk::MemoryAllocateInfo::builder()
-                    .allocation_size(mem_requirements.size)
-                    .memory_type_index(mem_type_index);
-                let memory = unsafe {
-                    let mem = device.allocate_memory(&alloc_info, None)?;
-                    device.bind_image_memory(image, mem, 0)?;
-                    mem
-                };
-
-                (image, memory)
-            };
+            let (image, image_mem) = allocator.create_image(device, width, height)?;
 
             // Transition the image layout and copy the buffer into the image
             // and transition the layout again to be readable from fragment shader.
@@ -492,8 +427,8 @@ mod texture {
                     })
                     .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
                     .image_extent(vk::Extent3D {
-                        width: width,
-                        height: height,
+                        width,
+                        height,
                         depth: 1,
                     })
                     .build();
@@ -529,7 +464,7 @@ mod texture {
                 let create_info = vk::ImageViewCreateInfo::builder()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
+                    .format(vk::Format::R8G8B8A8_UNORM)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -561,24 +496,71 @@ mod texture {
                 unsafe { device.create_sampler(&sampler_info, None)? }
             };
 
-            Ok(Self {
-                buffer,
-                buffer_mem,
+            let texture = Self {
                 image,
                 image_mem,
                 image_view,
                 sampler,
-            })
+            };
+
+            Ok((texture, buffer, buffer_mem))
         }
-        pub fn destroy(&mut self, device: &Device) {
+
+        /// Free texture's resources.
+        pub fn destroy(self, device: &Device, allocator: &mut Allocator) -> RendererResult<()> {
             unsafe {
                 device.destroy_sampler(self.sampler, None);
                 device.destroy_image_view(self.image_view, None);
-                device.destroy_image(self.image, None);
-                device.free_memory(self.image_mem, None);
-                device.destroy_buffer(self.buffer, None);
-                device.free_memory(self.buffer_mem, None);
+                allocator.destroy_image(device, self.image, self.image_mem)?;
             }
+            Ok(())
         }
+    }
+
+    fn execute_one_time_commands<R, F: FnOnce(vk::CommandBuffer) -> R>(
+        device: &Device,
+        queue: vk::Queue,
+        pool: vk::CommandPool,
+        executor: F,
+    ) -> RendererResult<R> {
+        let command_buffer = {
+            let alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_pool(pool)
+                .command_buffer_count(1);
+
+            unsafe { device.allocate_command_buffers(&alloc_info)?[0] }
+        };
+        let command_buffers = [command_buffer];
+
+        // Begin recording
+        {
+            let begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe { device.begin_command_buffer(command_buffer, &begin_info)? };
+        }
+
+        // Execute user function
+        let executor_result = executor(command_buffer);
+
+        // End recording
+        unsafe { device.end_command_buffer(command_buffer)? };
+
+        // Submit and wait
+        {
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(&command_buffers)
+                .build();
+            let submit_infos = [submit_info];
+            unsafe {
+                device.queue_submit(queue, &submit_infos, vk::Fence::null())?;
+                device.queue_wait_idle(queue)?;
+            };
+        }
+
+        // Free
+        unsafe { device.free_command_buffers(pool, &command_buffers) };
+
+        Ok(executor_result)
     }
 }

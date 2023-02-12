@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use simple_logger::SimpleLogger;
 use std::error::Error;
 
 const APP_NAME: &str = "test drawing channel split";
@@ -8,8 +9,8 @@ const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 
 fn main() -> Result<(), Box<dyn Error>> {
-    simple_logger::init()?;
-    System::new(APP_NAME)?.run(|_, ui| {
+    SimpleLogger::new().init()?;
+    System::new(APP_NAME)?.run((), |_, ui, _| {
         let draw_list = ui.get_window_draw_list();
         // Will draw channel 0 first, then channel 1, whatever the order of
         // the calls in the code.
