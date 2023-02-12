@@ -261,61 +261,6 @@ impl Renderer {
         let descriptor_set_layout = create_vulkan_descriptor_set_layout(&device)?;
 
         // Pipeline and layout
-<<<<<<< HEAD
-        let pipeline_layout =
-            create_vulkan_pipeline_layout(vk_context.device(), descriptor_set_layout)?;
-        let pipeline = create_vulkan_pipeline(vk_context.device(), pipeline_layout, render_pass)?;
-
-        // Font texture
-        let fonts_texture = {
-            let mut fonts = imgui.fonts();
-
-            let device_properties = unsafe {
-                vk_context
-                     .instance()
-                     .get_physical_device_properties(vk_context.physical_device())
-             };
-
-            // Texture width desired by user before building the atlas.
-            // Must be a power-of-two. If you have many glyphs and your graphics API has texture size
-            // restrictions, you may want to increase texture width to decrease the height.
-            // For example, Apple's Metal API (MTLTextureDescriptor) only supports
-            // a maximum size of 16384 (128x128) for texture dimension on M1 devices.
-            // We are defining the max width to be the max image dimension size get from device
-            // properties here to be safe.
-            fonts.tex_desired_width = device_properties.limits.max_image_dimension2_d as i32;
-
-            let atlas_texture = fonts.build_rgba32_texture();
-            let memory_properties = unsafe {
-                vk_context
-                    .instance()
-                    .get_physical_device_memory_properties(vk_context.physical_device())
-            };
-
-            execute_one_time_commands(
-                vk_context.device(),
-                vk_context.queue(),
-                vk_context.command_pool(),
-                |buffer| {
-                    Texture::cmd_from_rgba(
-                        vk_context.device(),
-                        buffer,
-                        memory_properties,
-                        atlas_texture.width,
-                        atlas_texture.height,
-                        vk::Format::R8G8B8A8_UNORM,
-                        &atlas_texture.data,
-                    )
-                },
-            )??
-        };
-
-        // Descriptor set
-        let (descriptor_pool, descriptor_set) = create_vulkan_descriptor_set(
-            vk_context.device(),
-            descriptor_set_layout,
-            &fonts_texture,
-=======
         let pipeline_layout = create_vulkan_pipeline_layout(&device, descriptor_set_layout)?;
         let pipeline = create_vulkan_pipeline(
             &device,
@@ -325,7 +270,6 @@ impl Renderer {
             #[cfg(feature = "dynamic-rendering")]
             dynamic_rendering,
             options,
->>>>>>> upstream/master
         )?;
 
         // Fonts texture
