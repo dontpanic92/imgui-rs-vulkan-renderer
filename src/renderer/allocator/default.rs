@@ -140,7 +140,7 @@ impl Allocate for Allocator {
     fn update_buffer<T: Copy>(
         &mut self,
         device: &Device,
-        memory: &Self::Memory,
+        memory: &mut Self::Memory,
         data: &[T],
     ) -> RendererResult<()> {
         let size = (data.len() * std::mem::size_of::<T>()) as _;
