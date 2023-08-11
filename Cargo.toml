@@ -20,19 +20,16 @@ exclude = [
 thiserror = "1.0"
 log = "0.4"
 imgui = "^0.10"
-ash = { version = ">=0.34, <=0.37", default-features = false, features = ["debug"] }
+ash = { version = "0.37", default-features = false, features = ["debug"] }
 ultraviolet = "0.9"
 
 gpu-allocator = { version = "0.22", default-features = false, features = ["vulkan"], optional = true }
 
-vk-mem = { version = "0.2", optional = true }
+vk-mem = { git = "https://github.com/gwihlidal/vk-mem-rs/", optional = true }
 
 [features]
 default = ["vk-mem"]
 dynamic-rendering = []
-
-[patch.crates-io]
-vk-mem = { git = "https://github.com/gwihlidal/vk-mem-rs/" }
 
 [dev-dependencies]
 simple_logger = "4.0"
