@@ -110,7 +110,7 @@ impl Renderer {
     ///
     /// * [`RendererError`] - If the number of in flight frame in incorrect.
     /// * [`RendererError`] - If any Vulkan or io error is encountered during initialization.
-    #[cfg(not(any(feature = "gpu-allocator", feature = "vk-mem")))]
+    #[cfg(not(any(feature = "gpu-allocator", feature = "vma")))]
     pub fn with_default_allocator(
         instance: &Instance,
         physical_device: vk::PhysicalDevice,

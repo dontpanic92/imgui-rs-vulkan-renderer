@@ -22,13 +22,11 @@ log = "0.4"
 imgui = "^0.10"
 ash = { version = "0.37", default-features = false, features = ["debug"] }
 ultraviolet = "0.9"
-
 gpu-allocator = { version = "0.22", default-features = false, features = ["vulkan"], optional = true }
-
-vk-mem = { git = "https://github.com/gwihlidal/vk-mem-rs/", optional = true }
+vma = { version = "0.3", optional = true }
 
 [features]
-default = ["vk-mem"]
+default = ["vma"]
 dynamic-rendering = []
 
 [dev-dependencies]

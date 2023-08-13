@@ -2,7 +2,7 @@ use super::Allocate;
 use crate::{RendererError, RendererResult};
 use ash::{vk, Device};
 use std::sync::{Arc, Mutex, MutexGuard};
-use vk_mem::{Alloc, Allocation, AllocationCreateInfo, Allocator as GpuAllocator, MemoryUsage};
+use vma::{Alloc, Allocation, AllocationCreateInfo, Allocator as GpuAllocator, MemoryUsage};
 
 /// Abstraction over memory used by Vulkan resources.
 pub type Memory = Allocation;
@@ -12,7 +12,7 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    pub fn new(allocator: Arc<Mutex<vk_mem::Allocator>>) -> Self {
+    pub fn new(allocator: Arc<Mutex<vma::Allocator>>) -> Self {
         Self { allocator }
     }
 
@@ -93,11 +93,11 @@ impl Allocate for Allocator {
         &mut self,
         _device: &Device,
         buffer: vk::Buffer,
-        memory: Self::Memory,
+        mut memory: Self::Memory,
     ) -> RendererResult<()> {
         let allocator = self.get_allocator()?;
 
-        unsafe { allocator.destroy_buffer(buffer, memory) };
+        unsafe { allocator.destroy_buffer(buffer, &mut memory) };
 
         Ok(())
     }
@@ -106,11 +106,11 @@ impl Allocate for Allocator {
         &mut self,
         _device: &Device,
         image: vk::Image,
-        memory: Self::Memory,
+        mut memory: Self::Memory,
     ) -> RendererResult<()> {
         let allocator = self.get_allocator()?;
 
-        unsafe { allocator.destroy_image(image, memory) };
+        unsafe { allocator.destroy_image(image, &mut memory) };
 
         Ok(())
     }
