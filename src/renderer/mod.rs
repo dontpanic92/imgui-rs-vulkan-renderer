@@ -10,7 +10,7 @@ use vulkan::*;
 
 use self::allocator::Allocator;
 
-#[cfg(not(any(feature = "gpu-allocator", feature = "vk-mem")))]
+#[cfg(not(any(feature = "gpu-allocator", feature = "vma")))]
 use ash::Instance;
 
 #[cfg(feature = "gpu-allocator")]
@@ -19,10 +19,10 @@ use {
     std::sync::{Arc, Mutex},
 };
 
-#[cfg(feature = "vk-mem")]
+#[cfg(feature = "vma")]
 use {
     std::sync::{Arc, Mutex},
-    vk_mem::Allocator as VkMemAllocator,
+    vma::Allocator as VkMemAllocator,
 };
 
 /// Convenient return type for function that can return a [`RendererError`].
@@ -212,8 +212,8 @@ impl Renderer {
     ///
     /// * [`RendererError`] - If the number of in flight frame in incorrect.
     /// * [`RendererError`] - If any Vulkan or io error is encountered during initialization.
-    #[cfg(feature = "vk-mem")]
-    pub fn with_vk_mem_allocator(
+    #[cfg(feature = "vma")]
+    pub fn with_vma_allocator(
         vk_mem_allocator: Arc<Mutex<VkMemAllocator>>, // TODO: Another way ?
         device: Device,
         queue: vk::Queue,

@@ -30,7 +30,7 @@ use {
     gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc},
     std::sync::{Arc, Mutex},
 };
-#[cfg(feature = "vk-mem")]
+#[cfg(feature = "vma")]
 use {
     std::sync::{Arc, Mutex},
     vk_mem::{Allocator, AllocatorCreateInfo},
@@ -160,7 +160,7 @@ impl<A: App> System<A> {
             )?
         };
 
-        #[cfg(feature = "vk-mem")]
+        #[cfg(feature = "vma")]
         let renderer = {
             let allocator = {
                 let allocator_create_info = AllocatorCreateInfo::new(
@@ -173,7 +173,7 @@ impl<A: App> System<A> {
                 Allocator::new(allocator_create_info)?
             };
 
-            Renderer::with_vk_mem_allocator(
+            Renderer::with_vma_allocator(
                 Arc::new(Mutex::new(allocator)),
                 vulkan_context.device.clone(),
                 vulkan_context.graphics_queue,
@@ -187,7 +187,7 @@ impl<A: App> System<A> {
             )?
         };
 
-        #[cfg(not(any(feature = "gpu-allocator", feature = "vk-mem")))]
+        #[cfg(not(any(feature = "gpu-allocator", feature = "vma")))]
         let renderer = Renderer::with_default_allocator(
             &vulkan_context.instance,
             vulkan_context.physical_device,
